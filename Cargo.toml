@@ -1,5 +1,5 @@
 [package]
-name = "kv-server"
+name = "kv-store"
 version = "0.1.0"
 edition = "2024"
 description = "HTTP server for any polystore::KvStore implementation. Backends: rocksdb (default), sled, memory."
@@ -9,7 +9,7 @@ keywords = ["kv", "http", "polystore", "server"]
 categories = ["database", "web-programming::http-server"]
 
 [[bin]]
-name = "kv-server"
+name = "kv-store"
 path = "src/bin/kv-server.rs"
 required-features = ["rocksdb-backend"]
 
