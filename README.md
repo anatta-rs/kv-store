@@ -1,28 +1,44 @@
-# polystore-kv-server
+# kv-server
 
-HTTP server wrapping any `polystore::KvStore` implementation. Exposes a simple REST API for distributed key-value operations.
+Trait-generic HTTP server and library for key-value storage. Ships both:
+- **HTTP server** (`kv-server` bin): standalone REST service with feature-gated backends
+- **Library** (`kv_server` crate): trait implementations and storage abstractions for embedding
 
 ## Features
 
-- Pluggable backends (RocksDB default, in-memory for dev/tests)
-- RESTful HTTP interface with CORS enabled
-- Comprehensive health checks and error handling
+Pluggable KvStore backends via Cargo features:
+- `rocksdb-backend` (default): embedded `RocksDB` for production use
+- `sled-backend`: embedded sled KV store
+- `memory-backend`: in-memory store (dev/tests only)
+
+HTTP server capabilities:
+- RESTful interface with CORS enabled
+- Content-addressable storage (SHA-256 `ContentHash`)
+- Automatic zstd compression via `ContentStore`
 - Streaming scan with prefix filtering
 - Request tracing via tower-http
 
 ## Usage
 
-Run the server with default RocksDB backend:
+### Running the HTTP server
+
+Run with default RocksDB backend:
 
 ```bash
 cargo run --release
+```
+
+Or disable default features:
+
+```bash
+cargo run --no-default-features --features rocksdb-backend --release
 ```
 
 Environment variables:
 
 - `KV_DATA_PATH` — storage directory (default: `/data/kv`)
 - `KV_PORT` — HTTP port (default: `8080`)
-- `RUST_LOG` — tracing level (default: `polystore_kv_server=debug,tower_http=debug`)
+- `RUST_LOG` — tracing level (default: `kv_server=debug,tower_http=debug`)
 
 ## API
 
@@ -63,23 +79,45 @@ GET /kv?prefix=foo
 → 200 OK + JSON array of {key, value (base64-encoded)}
 ```
 
-## Backends
+### Embedding in other crates
 
-### RocksDB (default)
-Production-grade persistent storage. Requires `rocksdb` system libraries.
+Use the library to build custom KvStore implementations:
 
-```bash
-cargo run --release
+```rust
+use kv_server::{RocksDbStore, KvStore};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let store = RocksDbStore::open(std::path::Path::new("./data"))?;
+    store.put("key:123", b"value".to_vec()).await?;
+    let val = store.get("key:123").await?;
+    Ok(())
+}
 ```
 
-### In-memory (development)
-Lightweight ephemeral store for testing. Rebuild polystore with memory backend feature and add `memory-backend` feature to this crate (future work).
+## Backends
+
+### RocksDB (default, feature: `rocksdb-backend`)
+Production-grade persistent embedded database.
+
+### sled (feature: `sled-backend`)
+Pure-Rust embedded database with ACID transactions.
+
+### In-memory (feature: `memory-backend`)
+Lightweight ephemeral store for testing and development.
 
 ## Building
 
 ```bash
+# Default build (rocksdb-backend)
 cargo build --release
+
+# Verify all configurations
 cargo check --all-targets --all-features
+cargo check --no-default-features
+cargo check --no-default-features --features memory-backend
+
+# Code quality
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo fmt --check
