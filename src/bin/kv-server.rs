@@ -1,7 +1,7 @@
-//! HTTP server wrapping any `polystore::KvStore` implementation.
+//! HTTP server wrapping any `KvStore` implementation.
 //!
 //! Exposes the [`KvStore`] trait operations as REST endpoints.
-//! Supports multiple backends (`RocksDB` default, in-memory for dev/tests).
+//! Supports multiple backends (`RocksDB` default, sled, memory, or HTTP client).
 //! Designed to run as a standalone service in docker-compose.
 
 use std::path::Path;
@@ -15,14 +15,14 @@ use axum::routing::{delete, get, head, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 
-use polystore_rocksdb::{KvStore, RocksDbStore};
+use kv_server::{KvStore, RocksDbStore};
 
 type AppState = Arc<RocksDbStore>;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
-        .with_env_filter("polystore_kv_server=debug,tower_http=debug")
+        .with_env_filter("kv_server=debug,tower_http=debug")
         .init();
 
     let data_path = std::env::var("KV_DATA_PATH").unwrap_or_else(|_| "/data/kv".to_string());
@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
-    tracing::info!("polystore-kv-server listening on {bind}");
+    tracing::info!("kv-server listening on {bind}");
     axum::serve(listener, app).await?;
     Ok(())
 }

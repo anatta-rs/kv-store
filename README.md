@@ -1,86 +1,66 @@
-# polystore-kv-server
+# kv-store
 
-HTTP server wrapping any `polystore::KvStore` implementation. Exposes a simple REST API for distributed key-value operations.
+> Implementations of [`polystore::KvStore`](https://github.com/anatta-rs/polystore) for multiple backends, plus an optional HTTP server bin.
 
-## Features
+## Philosophy
 
-- Pluggable backends (RocksDB default, in-memory for dev/tests)
-- RESTful HTTP interface with CORS enabled
-- Comprehensive health checks and error handling
-- Streaming scan with prefix filtering
-- Request tracing via tower-http
-
-## Usage
-
-Run the server with default RocksDB backend:
-
-```bash
-cargo run --release
-```
-
-Environment variables:
-
-- `KV_DATA_PATH` — storage directory (default: `/data/kv`)
-- `KV_PORT` — HTTP port (default: `8080`)
-- `RUST_LOG` — tracing level (default: `polystore_kv_server=debug,tower_http=debug`)
-
-## API
-
-### Health check
-```bash
-GET /health → 200 OK
-```
-
-### Get value
-```bash
-GET /kv/{key}
-→ 200 OK + binary value (on hit)
-→ 404 NOT FOUND (on miss)
-```
-
-### Put value
-```bash
-PUT /kv/{key} + binary body
-→ 201 CREATED
-```
-
-### Delete key
-```bash
-DELETE /kv/{key}
-→ 204 NO CONTENT
-```
-
-### Check existence
-```bash
-HEAD /kv/{key}
-→ 200 OK (exists)
-→ 404 NOT FOUND (missing)
-```
-
-### Scan with prefix
-```bash
-GET /kv?prefix=foo
-→ 200 OK + JSON array of {key, value (base64-encoded)}
-```
+- **Lib-first**: `KvStore` trait impls for multiple backends, each gated by a feature flag. Embed directly into your application.
+- **Bin-optional**: an HTTP server (`kv-server` bin) for distributed access. Only compiled when a backend feature is enabled.
+- **Backends as features**: pick one or many; runtime CLI flag selects which backend the bin uses.
 
 ## Backends
 
-### RocksDB (default)
-Production-grade persistent storage. Requires `rocksdb` system libraries.
+| Feature | Crate dep | Status |
+|---|---|---|
+| `rocksdb-backend` (default) | `rocksdb` | ready |
+| `sled-backend` | `sled` | ready |
+| `memory-backend` | — | dev / tests |
 
-```bash
-cargo run --release
+## Use as a library
+
+```rust
+use kv_store::{KvStore, RocksDbStore};
+
+let store = RocksDbStore::open("/data/kv")?;
+store.put(b"key", b"value").await?;
+let v = store.get(b"key").await?;
 ```
 
-### In-memory (development)
-Lightweight ephemeral store for testing. Rebuild polystore with memory backend feature and add `memory-backend` feature to this crate (future work).
+Disable defaults to ship without RocksDB :
 
-## Building
+```toml
+[dependencies]
+kv-store = { git = "https://github.com/anatta-rs/kv-store", default-features = false, features = ["sled-backend"] }
+```
+
+## Use as a binary (HTTP server)
 
 ```bash
-cargo build --release
-cargo check --all-targets --all-features
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-cargo fmt --check
+cargo install --git https://github.com/anatta-rs/kv-store --features rocksdb-backend
+KV_DATA_PATH=/data/kv KV_PORT=8080 kv-server
 ```
+
+CLI flags pick the backend at runtime when multiple are compiled in.
+
+## HTTP API
+
+```
+GET    /health           → 200 OK
+GET    /kv/{key}         → 200 + bytes | 404
+PUT    /kv/{key}         → 201 (body = bytes)
+DELETE /kv/{key}         → 204
+GET    /scan?prefix=X    → 200 + JSON list (streamed)
+```
+
+## Roadmap
+
+| | |
+|---|---|
+| ✅ rocksdb / sled / memory backends | |
+| ✅ HTTP server bin | |
+| 🟡 backend-agnostic CLI flag (`--backend rocksdb`) | |
+| 🟡 stream `/scan` as NDJSON | |
+
+## License
+
+Apache-2.0.

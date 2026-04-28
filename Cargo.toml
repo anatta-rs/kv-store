@@ -1,19 +1,29 @@
 [package]
-name = "polystore-kv-server"
+name = "kv-store"
 version = "0.1.0"
 edition = "2024"
-description = "HTTP server wrapping polystore::KvStore implementations (Bytes-in/Bytes-out)"
+description = "HTTP server for any polystore::KvStore implementation. Backends: rocksdb (default), sled, memory."
 license = "MIT"
-repository = "https://github.com/anatta-rs/polystore-kv-server"
+repository = "https://github.com/anatta-rs/kv-server"
 keywords = ["kv", "http", "polystore", "server"]
 categories = ["database", "web-programming::http-server"]
 
 [[bin]]
-name = "polystore-kv-server"
-path = "src/main.rs"
+name = "kv-store"
+path = "src/bin/kv-server.rs"
+required-features = ["rocksdb-backend"]
+
+[lib]
+name = "kv_server"
+path = "src/lib.rs"
+
+[features]
+default = ["rocksdb-backend"]
+rocksdb-backend = ["dep:rocksdb"]
+sled-backend = ["dep:sled"]
+memory-backend = []
 
 [dependencies]
-polystore-rocksdb = { git = "https://github.com/anatta-rs/polystore-rocksdb", branch = "main" }
 axum = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -21,6 +31,13 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
+thiserror = "2"
+sha2 = "0.10"
+hex = "0.4"
+zstd = "0.13"
+rocksdb = { version = "0.23", optional = true }
+sled = { version = "0.34", optional = true }
+reqwest = { version = "0.12", features = ["json"] }
 
 [lints.rust]
 unsafe_code = "deny"
