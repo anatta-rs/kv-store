@@ -1,46 +1,49 @@
 [package]
 name = "kv-store"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "HTTP server for any polystore::KvStore implementation. Backends: rocksdb (default), sled, memory."
-license = "MIT"
-repository = "https://github.com/anatta-rs/kv-server"
-keywords = ["kv", "http", "polystore", "server"]
-categories = ["database", "web-programming::http-server"]
+description = "Content-addressed store (sha-256, zstd) over a key-value port; rocksdb and memory backends; optional HTTP server."
+license = "Apache-2.0"
+repository = "https://github.com/anatta-rs/kv-store"
+keywords = ["kv", "cas", "content-addressed", "rocksdb"]
+categories = ["database"]
 
 [[bin]]
 name = "kv-store"
 path = "src/bin/kv-server.rs"
-required-features = ["rocksdb-backend"]
+required-features = ["rocksdb-backend", "http-server"]
 
 [lib]
-name = "kv_server"
+name = "kv_store"
 path = "src/lib.rs"
 
 [features]
 default = ["rocksdb-backend"]
 rocksdb-backend = ["dep:rocksdb"]
-sled-backend = ["dep:sled"]
 memory-backend = []
+http-server = ["dep:axum", "dep:tower-http", "dep:tracing-subscriber", "dep:reqwest", "dep:serde_json", "tokio/full"]
 
 [dependencies]
-axum = "0.8"
+axum = { version = "0.8", optional = true }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tokio = { version = "1", features = ["full"] }
+serde_json = { version = "1.0", optional = true }
+tokio = { version = "1", default-features = false, features = ["sync"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tower-http = { version = "0.6", features = ["trace", "cors"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+tower-http = { version = "0.6", features = ["trace", "cors"], optional = true }
 thiserror = "2"
 sha2 = "0.10"
 hex = "0.4"
 zstd = "0.13"
 rocksdb = { version = "0.23", optional = true }
-sled = { version = "0.34", optional = true }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tempfile = "3"
 
 [lints.rust]
-unsafe_code = "deny"
+unsafe_code = "forbid"
 missing_docs = "warn"
 
 [lints.clippy]

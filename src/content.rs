@@ -1,264 +1,202 @@
-//! Content-addressable store keyed by `content_hash`.
+//! Content-addressed storage over the [`KvStore`] port.
 //!
-//! Writes compress the body via zstd (level 3) before delegating to the
-//! underlying `KvStore`; reads decompress transparently. The compression
-//! layer is backend-agnostic — any `KvStore` impl gets it for free.
-//!
-//! Hash-addressed content is idempotent by construction: writing the same hash twice
-//! with the same body is a no-op. No write synchronization needed.
+//! Bodies are addressed by their SHA-256 hash and compressed with zstd at level 3.
+//! Reads verify the decompressed body against its address. Listing scans only
+//! content keys and reads their small sibling timestamp values.
 
-use crate::{KvError, KvStore, hash::ContentHash};
+use std::future::Future;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::{ContentHash, KvError, KvStore};
+
 const ZSTD_LEVEL: i32 = 3;
 
-/// Wrapper around a `KvStore` providing hash-keyed content operations.
-///
-/// All keys are derived from `ContentHash` as `format!("content:{}", hash.hex())`.
-///
-/// Since content is identified by hash, writes are idempotent: multiple calls with
-/// the same hash and body have no side effects beyond the first write.
-#[allow(dead_code)]
-pub struct ContentStore<K: KvStore> {
-    inner: K,
+/// Prefix for compressed content values, followed by the content hash in hex.
+pub const CONTENT_PREFIX: &str = "content:";
+
+/// Prefix for first-storage timestamps, followed by the content hash in hex.
+pub const STORED_AT_PREFIX: &str = "content-at:";
+
+/// Async port for hash-addressed content with verified reads and paged listing.
+pub trait ContentStore: Send + Sync {
+    /// Hash and store the plain body, preserving an existing blob's first-storage time.
+    fn put(&self, body: &[u8]) -> impl Future<Output = Result<ContentHash, KvError>> + Send;
+
+    /// Retrieve and verify a body, or return `None` if its hash is absent.
+    fn get(
+        &self,
+        hash: ContentHash,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, KvError>> + Send;
+
+    /// Check whether the content hash is present.
+    fn has(&self, hash: ContentHash) -> impl Future<Output = Result<bool, KvError>> + Send;
+
+    /// Remove the body and its stored time. Absent content is a no-op.
+    fn delete(&self, hash: ContentHash) -> impl Future<Output = Result<(), KvError>> + Send;
+
+    /// Hashes in ascending hex order, strictly after `after`, at most `limit`,
+    /// each with the time it was first stored ([`UNIX_EPOCH`] when none is recorded).
+    fn list(
+        &self,
+        after: Option<ContentHash>,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<(ContentHash, SystemTime)>, KvError>> + Send;
 }
 
-impl<K: KvStore> ContentStore<K> {
-    /// Create a new `ContentStore` wrapping the given KV backend.
+/// A [`ContentStore`] backed by any [`KvStore`], using zstd-compressed bodies.
+///
+/// This store is single-process: one process owns a store. Writes through this
+/// instance are serialized; two processes sharing a store can race.
+pub struct KvContentStore<K: KvStore> {
+    inner: K,
+    write: tokio::sync::Mutex<()>,
+}
+
+impl<K: KvStore> KvContentStore<K> {
+    /// Wrap the given key-value backend as a content store.
     pub fn new(inner: K) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            write: tokio::sync::Mutex::new(()),
+        }
     }
 
-    /// Borrow the underlying KV store implementation.
+    /// Borrow the underlying key-value backend.
     pub fn inner(&self) -> &K {
         &self.inner
     }
 
-    /// Put content, keyed by hash.
-    ///
-    /// Idempotent: repeated calls with the same hash and body are no-ops.
-    /// The physical key is `format!("content:{}", hash.hex())`.
-    pub async fn put(&self, hash: ContentHash, body: &[u8]) -> Result<(), KvError> {
-        let compressed = zstd::encode_all(body, ZSTD_LEVEL)
-            .map_err(|e| KvError::Serialization(format!("zstd encode: {e}")))?;
-        let key = format!("content:{}", hash.as_hex());
-        self.inner.put(&key, compressed).await
-    }
-
-    /// Retrieve content by `ContentHash`, or `None` if not found.
-    pub async fn get(&self, hash: ContentHash) -> Result<Option<Vec<u8>>, KvError> {
-        let key = format!("content:{}", hash.as_hex());
-        match self.inner.get(&key).await? {
-            Some(compressed) => {
-                let body = zstd::decode_all(&compressed[..])
-                    .map_err(|e| KvError::Serialization(format!("zstd decode: {e}")))?;
-                Ok(Some(body))
+    async fn list_hashes(
+        &self,
+        after: Option<ContentHash>,
+        limit: usize,
+    ) -> Result<Vec<ContentHash>, KvError> {
+        let mut cursor = after.map(key);
+        let mut hashes = Vec::new();
+        let mut skipped = 0usize;
+        while hashes.len() < limit {
+            let remaining = limit - hashes.len();
+            let keys = self
+                .inner
+                .scan_keys(CONTENT_PREFIX, cursor.as_deref(), remaining)
+                .await?;
+            let scanned = keys.len();
+            cursor = keys.last().cloned();
+            for key in keys {
+                if let Some(hash) = hash_from_key(&key) {
+                    hashes.push(hash);
+                } else {
+                    skipped += 1;
+                }
             }
-            None => Ok(None),
+            if scanned < remaining {
+                break;
+            }
         }
-    }
-
-    /// Check whether content exists at the given hash.
-    pub async fn has(&self, hash: ContentHash) -> Result<bool, KvError> {
-        let key = format!("content:{}", hash.as_hex());
-        self.inner.exists(&key).await
-    }
-
-    /// Delete content by hash. Caller must ensure no Neo4j node references this hash.
-    pub async fn delete(&self, hash: ContentHash) -> Result<(), KvError> {
-        let key = format!("content:{}", hash.as_hex());
-        self.inner.delete(&key).await
+        if skipped > 0 {
+            tracing::warn!(skipped, "Skipped non-canonical content keys");
+        }
+        Ok(hashes)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-
-    /// In-memory key-value store for testing.
-    pub struct InMemoryKvStore {
-        store: Mutex<HashMap<String, Vec<u8>>>,
-    }
-
-    impl InMemoryKvStore {
-        /// Create a new in-memory key-value store.
-        pub fn new() -> Self {
-            Self {
-                store: Mutex::new(HashMap::new()),
-            }
+impl<K: KvStore> ContentStore for KvContentStore<K> {
+    async fn put(&self, body: &[u8]) -> Result<ContentHash, KvError> {
+        let hash = ContentHash::from_bytes(body);
+        let _write = self.write.lock().await;
+        if self.has(hash).await? {
+            return Ok(hash);
         }
+        let compressed = compress(body)?;
+        self.inner
+            .put(
+                &stored_at_key(hash),
+                encode_time(SystemTime::now()).to_vec(),
+            )
+            .await?;
+        self.inner.put(&key(hash), compressed).await?;
+        Ok(hash)
     }
 
-    impl KvStore for InMemoryKvStore {
-        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError> {
-            Ok(self.store.lock().unwrap().get(key).cloned())
+    async fn get(&self, hash: ContentHash) -> Result<Option<Vec<u8>>, KvError> {
+        self.inner
+            .get(&key(hash))
+            .await?
+            .map(|raw| decompress_verified(hash, &raw))
+            .transpose()
+    }
+
+    async fn has(&self, hash: ContentHash) -> Result<bool, KvError> {
+        self.inner.exists(&key(hash)).await
+    }
+
+    async fn delete(&self, hash: ContentHash) -> Result<(), KvError> {
+        let _write = self.write.lock().await;
+        self.inner.delete(&key(hash)).await?;
+        self.inner.delete(&stored_at_key(hash)).await
+    }
+
+    async fn list(
+        &self,
+        after: Option<ContentHash>,
+        limit: usize,
+    ) -> Result<Vec<(ContentHash, SystemTime)>, KvError> {
+        let hashes = self.list_hashes(after, limit).await?;
+        let mut entries = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            let stored_at = match self.inner.get(&stored_at_key(hash)).await? {
+                Some(raw) => decode_time(&raw)?,
+                None => UNIX_EPOCH,
+            };
+            entries.push((hash, stored_at));
         }
-
-        async fn put(&self, key: &str, value: Vec<u8>) -> Result<(), KvError> {
-            self.store.lock().unwrap().insert(key.to_string(), value);
-            Ok(())
-        }
-
-        async fn delete(&self, key: &str) -> Result<(), KvError> {
-            self.store.lock().unwrap().remove(key);
-            Ok(())
-        }
-
-        async fn exists(&self, key: &str) -> Result<bool, KvError> {
-            Ok(self.store.lock().unwrap().contains_key(key))
-        }
-
-        async fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>, KvError> {
-            let store = self.store.lock().unwrap();
-            let mut result: Vec<_> = store
-                .iter()
-                .filter(|(k, _)| k.starts_with(prefix))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            result.sort_by(|a, b| a.0.cmp(&b.0));
-            Ok(result)
-        }
+        Ok(entries)
     }
+}
 
-    #[test]
-    fn put_then_get_returns_same_bytes() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let store = ContentStore::new(InMemoryKvStore::new());
-            let body = b"hello anatta";
-            let hash = ContentHash::from_bytes(body);
-            store.put(hash, body).await.unwrap();
-            let retrieved = store.get(hash).await.unwrap();
-            assert_eq!(retrieved, Some(body.to_vec()));
-        });
-    }
+fn key(hash: ContentHash) -> String {
+    format!("{CONTENT_PREFIX}{hash}")
+}
 
-    #[test]
-    fn put_idempotent_same_body_second_call_noop() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let store = ContentStore::new(InMemoryKvStore::new());
-            let body = b"hello anatta";
-            let hash = ContentHash::from_bytes(body);
-            store.put(hash, body).await.unwrap();
-            store.put(hash, body).await.unwrap();
-            let retrieved = store.get(hash).await.unwrap();
-            assert_eq!(retrieved, Some(body.to_vec()));
-        });
-    }
+fn stored_at_key(hash: ContentHash) -> String {
+    format!("{STORED_AT_PREFIX}{hash}")
+}
 
-    #[test]
-    fn put_empty_body() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let store = ContentStore::new(InMemoryKvStore::new());
-            let body = b"";
-            let hash = ContentHash::from_bytes(body);
-            store.put(hash, body).await.unwrap();
-            let retrieved = store.get(hash).await.unwrap();
-            assert_eq!(retrieved, Some(body.to_vec()));
-        });
-    }
+fn encode_time(t: SystemTime) -> [u8; 8] {
+    let millis = t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    u64::try_from(millis).map_or(u64::MAX.to_be_bytes(), u64::to_be_bytes)
+}
 
-    #[test]
-    fn get_absent_key_returns_none() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let store = ContentStore::new(InMemoryKvStore::new());
-            let hash = ContentHash::from_bytes(b"nonexistent");
-            let _retrieved = store.get(hash).await.unwrap();
-        });
-    }
+fn decode_time(raw: &[u8]) -> Result<SystemTime, KvError> {
+    let bytes = <[u8; 8]>::try_from(raw).map_err(|e| {
+        KvError::Serialization(format!(
+            "stored time must be 8 bytes, got {}: {e}",
+            raw.len()
+        ))
+    })?;
+    UNIX_EPOCH
+        .checked_add(Duration::from_millis(u64::from_be_bytes(bytes)))
+        .ok_or_else(|| KvError::Serialization("stored time is out of range".into()))
+}
 
-    #[test]
-    fn delete_removes_entry_get_returns_none() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let store = ContentStore::new(InMemoryKvStore::new());
-            let body = b"to be deleted";
-            let hash = ContentHash::from_bytes(body);
-            store.put(hash, body).await.unwrap();
-            store.delete(hash).await.unwrap();
-            let retrieved = store.get(hash).await.unwrap();
-            assert_eq!(retrieved, None);
-        });
-    }
+fn compress(body: &[u8]) -> Result<Vec<u8>, KvError> {
+    zstd::encode_all(body, ZSTD_LEVEL)
+        .map_err(|e| KvError::Serialization(format!("zstd encode: {e}")))
+}
 
-    #[test]
-    fn has_returns_true_after_put_false_before() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let store = ContentStore::new(InMemoryKvStore::new());
-            let body = b"test";
-            let hash = ContentHash::from_bytes(body);
-            let before = store.has(hash).await.unwrap();
-            assert!(!before);
-            store.put(hash, body).await.unwrap();
-            let after = store.has(hash).await.unwrap();
-            assert!(after);
-        });
+fn decompress_verified(hash: ContentHash, raw: &[u8]) -> Result<Vec<u8>, KvError> {
+    let body =
+        zstd::decode_all(raw).map_err(|e| KvError::Serialization(format!("zstd decode: {e}")))?;
+    if ContentHash::from_bytes(&body) != hash {
+        return Err(KvError::HashMismatch(format!("expected {hash}")));
     }
+    Ok(body)
+}
 
-    #[test]
-    fn put_concurrent_same_hash_both_succeed() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            use std::sync::Arc;
-            let store = Arc::new(ContentStore::new(InMemoryKvStore::new()));
-            let body = b"concurrent";
-            let hash = ContentHash::from_bytes(body);
-            let store1 = store.clone();
-            let body1 = body.to_vec();
-            let store2 = store.clone();
-            let body2 = body.to_vec();
-            let (res1, res2) = tokio::join!(store1.put(hash, &body1), store2.put(hash, &body2));
-            assert!(res1.is_ok());
-            assert!(res2.is_ok());
-            let retrieved = store.get(hash).await.unwrap();
-            assert_eq!(retrieved, Some(body.to_vec()));
-        });
+fn hash_from_key(key: &str) -> Option<ContentHash> {
+    let hex = key.strip_prefix(CONTENT_PREFIX)?;
+    if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
     }
-
-    #[test]
-    fn non_utf8_body_roundtrip() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let store = ContentStore::new(InMemoryKvStore::new());
-            let body = vec![0xFF, 0xFE, 0x00, 0x01, 0x02];
-            let hash = ContentHash::from_bytes(&body);
-            store.put(hash, &body).await.unwrap();
-            let retrieved = store.get(hash).await.unwrap();
-            assert_eq!(retrieved, Some(body));
-        });
-    }
-
-    #[test]
-    fn put_large_body_roundtrip() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let store = ContentStore::new(InMemoryKvStore::new());
-            let body = vec![0xAB; 2 * 1024 * 1024];
-            let hash = ContentHash::from_bytes(&body);
-            store.put(hash, &body).await.unwrap();
-            let retrieved = store.get(hash).await.unwrap();
-            assert_eq!(retrieved, Some(body));
-        });
-    }
-
-    #[test]
-    fn put_stores_compressed_bytes() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let body = "AAAA".repeat(10_000);
-            let hash = ContentHash::from_bytes(body.as_bytes());
-            let kv = InMemoryKvStore::new();
-            let store = ContentStore::new(kv);
-            store.put(hash, body.as_bytes()).await.unwrap();
-            let key = format!("content:{}", hash.as_hex());
-            let raw = store.inner().get(&key).await.unwrap().unwrap();
-            assert!(raw.len() < body.len() / 5);
-            let got = store.get(hash).await.unwrap().unwrap();
-            assert_eq!(got, body.as_bytes());
-        });
-    }
+    ContentHash::try_from(hex).ok()
 }

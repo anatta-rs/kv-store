@@ -7,6 +7,10 @@ pub enum KvError {
     #[error("storage backend error: {0}")]
     Backend(String),
 
+    /// The backend does not support this operation.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
+
     /// The key was invalid (empty, too long, etc.).
     #[error("invalid key: {0}")]
     InvalidKey(String),

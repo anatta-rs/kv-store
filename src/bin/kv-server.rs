@@ -1,7 +1,7 @@
 //! HTTP server wrapping any `KvStore` implementation.
 //!
 //! Exposes the [`KvStore`] trait operations as REST endpoints.
-//! Supports multiple backends (`RocksDB` default, sled, memory, or HTTP client).
+//! Uses the `RocksDB` backend.
 //! Designed to run as a standalone service in docker-compose.
 
 use std::path::Path;
@@ -15,14 +15,14 @@ use axum::routing::{delete, get, head, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 
-use kv_server::{KvStore, RocksDbStore};
+use kv_store::{KvStore, RocksDbStore};
 
 type AppState = Arc<RocksDbStore>;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
-        .with_env_filter("kv_server=debug,tower_http=debug")
+        .with_env_filter("kv_store=debug,tower_http=debug")
         .init();
 
     let data_path = std::env::var("KV_DATA_PATH").unwrap_or_else(|_| "/data/kv".to_string());

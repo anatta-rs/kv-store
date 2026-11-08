@@ -31,6 +31,14 @@ pub trait KvStore: Send + Sync {
         &self,
         prefix: &str,
     ) -> impl Future<Output = Result<Vec<(String, Vec<u8>)>, KvError>> + Send;
+
+    /// Keys starting with `prefix`, strictly after `after`, ascending, at most `limit`; values not read.
+    fn scan_keys(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<String>, KvError>> + Send;
 }
 
 /// Blanket impl: any `&KvStore` is itself a `KvStore` (delegates to inner).
@@ -56,5 +64,14 @@ impl<T: KvStore + ?Sized> KvStore for &T {
         prefix: &str,
     ) -> impl Future<Output = Result<Vec<(String, Vec<u8>)>, KvError>> + Send {
         (**self).scan_prefix(prefix)
+    }
+
+    fn scan_keys(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> impl Future<Output = Result<Vec<String>, KvError>> + Send {
+        (**self).scan_keys(prefix, after, limit)
     }
 }

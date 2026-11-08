@@ -133,6 +133,19 @@ impl KvStore for HttpKvStore {
             })
             .collect()
     }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "Keep store operations deferred until the returned future is polled"
+    )]
+    async fn scan_keys(
+        &self,
+        _prefix: &str,
+        _after: Option<&str>,
+        _limit: usize,
+    ) -> Result<Vec<String>, KvError> {
+        Err(KvError::Unsupported("scan_keys over HTTP".into()))
+    }
 }
 
 #[derive(serde::Deserialize)]

@@ -27,6 +27,10 @@ impl RocksDbStore {
     }
 }
 
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "Keep store operations deferred until the returned future is polled"
+)]
 impl KvStore for RocksDbStore {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError> {
         Ok(self.db.get(key.as_bytes())?)
@@ -65,6 +69,39 @@ impl KvStore for RocksDbStore {
             results.push((key_str, value.to_vec()));
         }
 
+        Ok(results)
+    }
+
+    async fn scan_keys(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, KvError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let start = after.map_or(prefix, |after| prefix.max(after));
+        let mut iter = self.db.raw_iterator();
+        iter.seek(start.as_bytes());
+        let mut results = Vec::new();
+
+        while let Some(key) = iter.key() {
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            if Some(key) != after.map(str::as_bytes) {
+                let key = std::str::from_utf8(key)
+                    .map_err(|e| KvError::Backend(format!("non-UTF8 key: {e}")))?;
+                results.push(key.to_owned());
+                if results.len() == limit {
+                    break;
+                }
+            }
+            iter.next();
+        }
+        iter.status()?;
         Ok(results)
     }
 }

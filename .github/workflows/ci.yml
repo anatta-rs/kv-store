@@ -11,34 +11,13 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  fmt:
-    name: Formatting
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo fmt --all -- --check
-
-  clippy:
-    name: Lint
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-
-  test:
-    name: Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --all-features --release
-
   check:
-    name: Cargo check
+    name: Check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo check --all-targets --all-features
+      - uses: dtolnay/rust-toolchain@1.99
+        with:
+          components: rustfmt, clippy
+      - run: sudo apt-get install -y clang
+      - run: sh scripts/check.sh

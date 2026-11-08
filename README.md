@@ -1,66 +1,125 @@
 # kv-store
 
-> Implementations of [`polystore::KvStore`](https://github.com/anatta-rs/polystore) for multiple backends, plus an optional HTTP server bin.
+The deployment's content-addressed store (CAS): blobs addressed by SHA-256,
+compressed with zstd level 3, and stored under `content:<hex>` in a key-value
+backend. The store has no tenant.
 
-## Philosophy
+The deployment's CAS is never on a transport a caller reaches. Services read a
+blob in-process after `decide` on the graph node that references it.
 
-- **Lib-first**: `KvStore` trait impls for multiple backends, each gated by a feature flag. Embed directly into your application.
-- **Bin-optional**: an HTTP server (`kv-server` bin) for distributed access. Only compiled when a backend feature is enabled.
-- **Backends as features**: pick one or many; runtime CLI flag selects which backend the bin uses.
+## Content store
 
-## Backends
+`ContentStore` is the async CAS port. Its implementation, `KvContentStore<K: KvStore>`,
+wraps a key-value backend. Each operation returns a `Result` with `KvError` on failure:
 
-| Feature | Crate dep | Status |
-|---|---|---|
-| `rocksdb-backend` (default) | `rocksdb` | ready |
-| `sled-backend` | `sled` | ready |
-| `memory-backend` | — | dev / tests |
+| Operation | Successful result |
+| --- | --- |
+| `put(&[u8])` | `ContentHash`, computed from the uncompressed body |
+| `get(ContentHash)` | `Option<Vec<u8>>`, the uncompressed body or `None` |
+| `has(ContentHash)` | `bool`, whether the blob exists |
+| `delete(ContentHash)` | `()`, removing the blob and its stored time; absent blobs are a no-op |
+| `list(after: Option<ContentHash>, limit: usize)` | `Vec<(ContentHash, SystemTime)>` in ascending hash-hex order, strictly after the cursor, with at most `limit` entries |
 
-## Use as a library
+`get` verifies the decompressed body's hash and returns `KvError::HashMismatch`
+if it differs from the requested address.
+
+Each listed time is when the blob was first stored. Re-putting an existing blob
+preserves that time. It lives in the sibling key `content-at:<hex>` as eight
+bytes of big-endian `u64` Unix milliseconds, written before a new blob.
+`list` uses `KvStore::scan_keys` to page over content keys and reads only their
+small timestamp values. A blob without a recorded time is listed with
+`std::time::UNIX_EPOCH`.
+
+## Example
+
+Enable `memory-backend` for `MemoryStore`. This example uses Tokio as its async
+runtime and runs as a README doctest with
+`cargo test --features memory-backend --doc`.
 
 ```rust
-use kv_store::{KvStore, RocksDbStore};
+use kv_store::{ContentHash, ContentStore, KvContentStore, MemoryStore};
 
-let store = RocksDbStore::open("/data/kv")?;
-store.put(b"key", b"value").await?;
-let v = store.get(b"key").await?;
+#[tokio::main]
+async fn main() -> Result<(), kv_store::KvError> {
+    let store = KvContentStore::new(MemoryStore::new());
+    let body = b"hello anatta";
+
+    let hash = store.put(body).await?;
+    assert_eq!(hash, ContentHash::from_bytes(body));
+    assert_eq!(store.get(hash).await?, Some(body.to_vec()));
+    assert!(store.has(hash).await?);
+
+    let page = store.list(None, 100).await?;
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].0, hash);
+    assert!(page[0].1 > std::time::UNIX_EPOCH);
+    assert!(store.list(Some(hash), 100).await?.is_empty());
+    Ok(())
+}
 ```
 
-Disable defaults to ship without RocksDB :
+## Features
 
-```toml
-[dependencies]
-kv-store = { git = "https://github.com/anatta-rs/kv-store", default-features = false, features = ["sled-backend"] }
+| Feature | Default | Provides |
+| --- | --- | --- |
+| `rocksdb-backend` | On | `RocksDbStore`, an embedded persistent backend |
+| `memory-backend` | Off | `MemoryStore`, an ephemeral in-memory backend |
+| `http-server` | Off | The `kv-store` binary and `HttpKvStore` client; the binary also requires `rocksdb-backend` |
+
+Use `default-features = false` with `features = ["memory-backend"]` for a
+memory-only library dependency. The crate is imported as `kv_store`.
+
+## Optional HTTP server
+
+**For the user's own use only.** The HTTP server has no authentication, binds
+all interfaces (`0.0.0.0`), and enables permissive CORS. It serves the raw
+`KvStore`, not the CAS. It must not expose the deployment's content store to
+callers.
+
+Build and run it with the default RocksDB backend:
+
+```sh
+cargo run --features http-server --bin kv-store
 ```
 
-## Use as a binary (HTTP server)
+`KV_PORT` defaults to `8080`; `KV_DATA_PATH` defaults to `/data/kv`.
+Set `KV_DATA_PATH` to a writable directory when running locally.
 
-```bash
-cargo install --git https://github.com/anatta-rs/kv-store --features rocksdb-backend
-KV_DATA_PATH=/data/kv KV_PORT=8080 kv-server
+| Method | Route | Operation |
+| --- | --- | --- |
+| `GET` | `/health` | Health check |
+| `GET` | `/kv/{key}` | Read a raw value |
+| `PUT` | `/kv/{key}` | Write the request body as a raw value |
+| `DELETE` | `/kv/{key}` | Delete a key |
+| `HEAD` | `/kv/{key}` | Check whether a key exists |
+| `GET` | `/kv?prefix=` | Scan key/value pairs by prefix |
+
+`HttpKvStore::scan_keys` is unsupported and returns `KvError::Unsupported`;
+there is no keys-only HTTP route.
+
+## Checks and soak
+
+Use the shared Rust 1.99 toolchain and sccache:
+
+```sh
+. scripts/env.sh
+export CARGO_TARGET_DIR="$PWD/target"
+export RUSTC_WRAPPER=sccache
+sh scripts/check.sh
 ```
 
-CLI flags pick the backend at runtime when multiple are compiled in.
+The ignored soak writes and reads 1024 distinct, deterministically generated,
+incompressible 1 MiB bodies through `KvContentStore<RocksDbStore>`. It verifies
+hashes and paged listing with first-storage times, and prints elapsed times,
+put/get MiB/s, and the database directory's size. Timings include body generation
+and verification. Bodies are regenerated as needed instead of retaining 1 GiB
+in memory. The temporary database is created under Cargo's target temporary
+directory and removed when the test finishes.
 
-## HTTP API
-
+```sh
+cargo test --release --test soak -- --ignored --nocapture
 ```
-GET    /health           → 200 OK
-GET    /kv/{key}         → 200 + bytes | 404
-PUT    /kv/{key}         → 201 (body = bytes)
-DELETE /kv/{key}         → 204
-GET    /scan?prefix=X    → 200 + JSON list (streamed)
-```
-
-## Roadmap
-
-| | |
-|---|---|
-| ✅ rocksdb / sled / memory backends | |
-| ✅ HTTP server bin | |
-| 🟡 backend-agnostic CLI flag (`--backend rocksdb`) | |
-| 🟡 stream `/scan` as NDJSON | |
 
 ## License
 
-Apache-2.0.
+Apache-2.0. See [LICENSE](LICENSE).
