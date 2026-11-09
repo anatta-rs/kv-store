@@ -1,6 +1,6 @@
 [package]
 name = "kv-store"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Content-addressed store (sha-256, zstd) over a key-value port; rocksdb and memory backends; optional HTTP server."
 license = "Apache-2.0"

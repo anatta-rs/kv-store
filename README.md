@@ -23,9 +23,9 @@ wraps a key-value backend. Each operation returns a `Result` with `KvError` on f
 `get` verifies the decompressed body's hash and returns `KvError::HashMismatch`
 if it differs from the requested address.
 
-Each listed time is when the blob was first stored. Re-putting an existing blob
-preserves that time. It lives in the sibling key `content-at:<hex>` as eight
-bytes of big-endian `u64` Unix milliseconds, written before a new blob.
+Each listed time is when the blob was last put. Re-putting an existing blob
+refreshes that time and leaves its bytes untouched. It lives in the sibling key `content-at:<hex>` as eight
+bytes of big-endian `u64` Unix milliseconds, written before a new blob's bytes.
 `list` uses `KvStore::scan_keys` to page over content keys and reads only their
 small timestamp values. A blob without a recorded time is listed with
 `std::time::UNIX_EPOCH`.
@@ -110,7 +110,7 @@ sh scripts/check.sh
 
 The ignored soak writes and reads 1024 distinct, deterministically generated,
 incompressible 1 MiB bodies through `KvContentStore<RocksDbStore>`. It verifies
-hashes and paged listing with first-storage times, and prints elapsed times,
+hashes and paged listing with stored times, and prints elapsed times,
 put/get MiB/s, and the database directory's size. Timings include body generation
 and verification. Bodies are regenerated as needed instead of retaining 1 GiB
 in memory. The temporary database is created under Cargo's target temporary

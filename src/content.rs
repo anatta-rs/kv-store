@@ -14,12 +14,13 @@ const ZSTD_LEVEL: i32 = 3;
 /// Prefix for compressed content values, followed by the content hash in hex.
 pub const CONTENT_PREFIX: &str = "content:";
 
-/// Prefix for first-storage timestamps, followed by the content hash in hex.
+/// Prefix for last-put timestamps, followed by the content hash in hex.
 pub const STORED_AT_PREFIX: &str = "content-at:";
 
 /// Async port for hash-addressed content with verified reads and paged listing.
 pub trait ContentStore: Send + Sync {
-    /// Hash and store the plain body, preserving an existing blob's first-storage time.
+    /// Hash and store the plain body. Putting a held blob again leaves its bytes
+    /// untouched and refreshes its stored time to now: the time is that of the last put.
     fn put(&self, body: &[u8]) -> impl Future<Output = Result<ContentHash, KvError>> + Send;
 
     /// Retrieve and verify a body, or return `None` if its hash is absent.
@@ -35,7 +36,7 @@ pub trait ContentStore: Send + Sync {
     fn delete(&self, hash: ContentHash) -> impl Future<Output = Result<(), KvError>> + Send;
 
     /// Hashes in ascending hex order, strictly after `after`, at most `limit`,
-    /// each with the time it was first stored ([`UNIX_EPOCH`] when none is recorded).
+    /// each with the time of its last put ([`UNIX_EPOCH`] when none is recorded).
     fn list(
         &self,
         after: Option<ContentHash>,
@@ -104,16 +105,14 @@ impl<K: KvStore> ContentStore for KvContentStore<K> {
     async fn put(&self, body: &[u8]) -> Result<ContentHash, KvError> {
         let hash = ContentHash::from_bytes(body);
         let _write = self.write.lock().await;
+        let stored_at = encode_time(SystemTime::now()).to_vec();
         if self.has(hash).await? {
+            // Held bytes stay untouched: only the stored time moves to now.
+            self.inner.put(&stored_at_key(hash), stored_at).await?;
             return Ok(hash);
         }
         let compressed = compress(body)?;
-        self.inner
-            .put(
-                &stored_at_key(hash),
-                encode_time(SystemTime::now()).to_vec(),
-            )
-            .await?;
+        self.inner.put(&stored_at_key(hash), stored_at).await?;
         self.inner.put(&key(hash), compressed).await?;
         Ok(hash)
     }

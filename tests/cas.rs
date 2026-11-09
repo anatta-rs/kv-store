@@ -244,13 +244,40 @@ async fn list_reports_stored_at<K: KvStore>(s: &KvContentStore<K>) {
     assert!(entries[0].1 <= after);
 }
 
-async fn reput_keeps_first_stored_at<K: KvStore>(s: &KvContentStore<K>) {
-    let body = b"keep the first time";
+async fn a_re_put_of_held_bytes_refreshes_stored_at_and_keeps_the_bytes<K: KvStore>(
+    s: &KvContentStore<K>,
+) {
+    let body = b"refresh the time, keep the bytes";
+    let hash = s.put(body).await.unwrap();
+    s.inner()
+        .put(
+            &format!("content-at:{hash}"),
+            1000u64.to_be_bytes().to_vec(),
+        )
+        .await
+        .unwrap();
+    let before = SystemTime::now() - Duration::from_secs(60);
+    assert_eq!(s.put(body).await.unwrap(), hash);
+    let entries = s.list(None, 10).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].0, hash);
+    assert!(entries[0].1 > UNIX_EPOCH + Duration::from_millis(1000));
+    assert!(entries[0].1 >= before);
+    assert_eq!(s.get(hash).await.unwrap(), Some(body.to_vec()));
+    assert!(s.has(hash).await.unwrap());
+}
+
+async fn a_re_put_of_a_blob_without_a_time_records_one<K: KvStore>(s: &KvContentStore<K>) {
+    let body = b"legacy blob re-imported";
+    let hash = s.put(body).await.unwrap();
+    s.inner()
+        .delete(&format!("content-at:{hash}"))
+        .await
+        .unwrap();
     s.put(body).await.unwrap();
-    let first = s.list(None, 10).await.unwrap();
-    std::thread::sleep(Duration::from_millis(5));
-    s.put(body).await.unwrap();
-    assert_eq!(s.list(None, 10).await.unwrap(), first);
+    let entries = s.list(None, 10).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].1 > UNIX_EPOCH);
 }
 
 async fn list_without_time_is_epoch<K: KvStore>(s: &KvContentStore<K>) {
@@ -430,9 +457,14 @@ both_backends!(
     rocksdb_list_reports_stored_at
 );
 both_backends!(
-    reput_keeps_first_stored_at,
-    memory_reput_keeps_first_stored_at,
-    rocksdb_reput_keeps_first_stored_at
+    a_re_put_of_held_bytes_refreshes_stored_at_and_keeps_the_bytes,
+    memory_a_re_put_of_held_bytes_refreshes_stored_at_and_keeps_the_bytes,
+    rocksdb_a_re_put_of_held_bytes_refreshes_stored_at_and_keeps_the_bytes
+);
+both_backends!(
+    a_re_put_of_a_blob_without_a_time_records_one,
+    memory_a_re_put_of_a_blob_without_a_time_records_one,
+    rocksdb_a_re_put_of_a_blob_without_a_time_records_one
 );
 both_backends!(
     list_without_time_is_epoch,

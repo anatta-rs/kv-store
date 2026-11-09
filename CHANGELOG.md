@@ -3,6 +3,17 @@
 All notable changes to this project are documented here, following the
 Keep a Changelog format and Semantic Versioning.
 
+## Unreleased
+
+## 0.2.1 - 2026-11-09
+
+### Fixed
+
+- `put` of bytes already held now refreshes the stored time (`content-at:<hex>`) to now,
+  without rewriting or recompressing the bytes. Before, the first time was kept, so a
+  consumer's grace window was bypassed for an old blob orphaned and re-imported.
+  The listed time is now that of the last put.
+
 ## 0.2.0 - 2026-11-08
 
 ### Breaking
