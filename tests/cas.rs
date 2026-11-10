@@ -1,5 +1,7 @@
 //! Shared CAS conformance cases for the memory and `RocksDB` backends.
 
+#[cfg(feature = "memory-backend")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "memory-backend")]
@@ -297,6 +299,233 @@ async fn delete_removes_stored_at<K: KvStore>(s: &KvContentStore<K>) {
     assert!(!s.inner().exists(&key).await.unwrap());
 }
 
+fn bodies(n: usize) -> Vec<Vec<u8>> {
+    (0..n)
+        .map(|i| format!("batched body {i}").into_bytes())
+        .collect()
+}
+
+fn as_slices(bodies: &[Vec<u8>]) -> Vec<&[u8]> {
+    bodies.iter().map(Vec::as_slice).collect()
+}
+
+async fn put_many_then_get_many_roundtrip<K: KvStore>(s: &KvContentStore<K>) {
+    let mut all = bodies(5);
+    all.push(Vec::new());
+    let hashes = s.put_many(&as_slices(&all)).await.unwrap();
+    let expected: Vec<ContentHash> = all.iter().map(|b| ContentHash::from_bytes(b)).collect();
+    assert_eq!(hashes, expected);
+    let got = s.get_many(&hashes).await.unwrap();
+    assert_eq!(got, all.into_iter().map(Some).collect::<Vec<_>>());
+}
+
+async fn get_many_keeps_the_asked_order<K: KvStore>(s: &KvContentStore<K>) {
+    let all = bodies(12);
+    let hashes = s.put_many(&as_slices(&all)).await.unwrap();
+    let mut pairs: Vec<_> = hashes.iter().copied().zip(all).collect();
+    pairs.sort_by_key(|(hash, _)| std::cmp::Reverse(hash.as_hex()));
+    pairs.rotate_left(5);
+    let asked: Vec<ContentHash> = pairs.iter().map(|(hash, _)| *hash).collect();
+    let got = s.get_many(&asked).await.unwrap();
+    assert_eq!(
+        got,
+        pairs
+            .into_iter()
+            .map(|(_, body)| Some(body))
+            .collect::<Vec<_>>()
+    );
+}
+
+async fn get_many_missing_is_none_in_place<K: KvStore>(s: &KvContentStore<K>) {
+    let held = s.put(b"held").await.unwrap();
+    let absent = ContentHash::from_bytes(b"absent");
+    let got = s.get_many(&[absent, held, absent]).await.unwrap();
+    assert_eq!(got, vec![None, Some(b"held".to_vec()), None]);
+}
+
+async fn get_many_same_hash_twice_is_two_answers<K: KvStore>(s: &KvContentStore<K>) {
+    let hash = s.put(b"twice").await.unwrap();
+    let got = s.get_many(&[hash, hash]).await.unwrap();
+    assert_eq!(got, vec![Some(b"twice".to_vec()), Some(b"twice".to_vec())]);
+}
+
+async fn empty_batches_are_empty_answers<K: KvStore>(s: &KvContentStore<K>) {
+    assert_eq!(
+        s.get_many(&[]).await.unwrap(),
+        Vec::<Option<Vec<u8>>>::new()
+    );
+    assert_eq!(s.put_many(&[]).await.unwrap(), Vec::<ContentHash>::new());
+    assert_eq!(s.list(None, 10).await.unwrap().len(), 0);
+}
+
+async fn put_many_of_held_bodies_keeps_one_copy_and_refreshes_time<K: KvStore>(
+    s: &KvContentStore<K>,
+) {
+    let body: &[u8] = b"held, refreshed by a batch";
+    let hash = s.put(body).await.unwrap();
+    let raw_before = s.inner().get(&format!("content:{hash}")).await.unwrap();
+    s.inner()
+        .put(
+            &format!("content-at:{hash}"),
+            1000u64.to_be_bytes().to_vec(),
+        )
+        .await
+        .unwrap();
+    let hashes = s
+        .put_many(&[body, b"new in the batch", body])
+        .await
+        .unwrap();
+    assert_eq!(hashes[0], hash);
+    assert_eq!(hashes[2], hash);
+    let entries = s.list(None, 10).await.unwrap();
+    assert_eq!(entries.len(), 2);
+    let held = entries.iter().find(|(h, _)| *h == hash).unwrap();
+    assert!(held.1 > UNIX_EPOCH + Duration::from_secs(60));
+    assert_eq!(
+        s.inner().get(&format!("content:{hash}")).await.unwrap(),
+        raw_before
+    );
+    assert_eq!(s.get(hash).await.unwrap(), Some(body.to_vec()));
+}
+
+async fn get_many_of_1000_hashes<K: KvStore>(s: &KvContentStore<K>) {
+    let all = bodies(1000);
+    let hashes = s.put_many(&as_slices(&all)).await.unwrap();
+    assert_eq!(s.list(None, 2000).await.unwrap().len(), 1000);
+    let got = s.get_many(&hashes).await.unwrap();
+    assert_eq!(got, all.into_iter().map(Some).collect::<Vec<_>>());
+}
+
+async fn get_many_with_a_corrupted_body_is_an_error<K: KvStore>(s: &KvContentStore<K>) {
+    let all = bodies(3);
+    let hashes = s.put_many(&as_slices(&all)).await.unwrap();
+    let corrupted = zstd::encode_all(&b"another body"[..], 3).unwrap();
+    s.inner()
+        .put(&format!("content:{}", hashes[1]), corrupted)
+        .await
+        .unwrap();
+    match s.get_many(&hashes).await {
+        Err(KvError::HashMismatch(message)) => assert!(message.contains(&hashes[1].as_hex())),
+        result => panic!("expected a hash mismatch, got {result:?}"),
+    }
+}
+
+#[cfg(feature = "memory-backend")]
+#[derive(Default)]
+struct Counts {
+    get: AtomicUsize,
+    get_many: AtomicUsize,
+    put: AtomicUsize,
+    put_many: AtomicUsize,
+}
+
+// Counts every backend call so a test can tell one batch from one call per hash.
+#[cfg(feature = "memory-backend")]
+struct Counting<K> {
+    inner: K,
+    counts: Counts,
+}
+
+#[cfg(feature = "memory-backend")]
+impl<K> Counting<K> {
+    fn new(inner: K) -> Self {
+        Self {
+            inner,
+            counts: Counts::default(),
+        }
+    }
+}
+
+#[cfg(feature = "memory-backend")]
+fn count(counter: &AtomicUsize) -> usize {
+    counter.load(Ordering::SeqCst)
+}
+
+#[cfg(feature = "memory-backend")]
+impl<K: KvStore> KvStore for Counting<K> {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError> {
+        self.counts.get.fetch_add(1, Ordering::SeqCst);
+        self.inner.get(key).await
+    }
+
+    async fn get_many(&self, keys: &[String]) -> Result<Vec<Option<Vec<u8>>>, KvError> {
+        self.counts.get_many.fetch_add(1, Ordering::SeqCst);
+        self.inner.get_many(keys).await
+    }
+
+    async fn put(&self, key: &str, value: Vec<u8>) -> Result<(), KvError> {
+        self.counts.put.fetch_add(1, Ordering::SeqCst);
+        self.inner.put(key, value).await
+    }
+
+    async fn put_many(&self, entries: Vec<(String, Vec<u8>)>) -> Result<(), KvError> {
+        self.counts.put_many.fetch_add(1, Ordering::SeqCst);
+        self.inner.put_many(entries).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), KvError> {
+        self.inner.delete(key).await
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool, KvError> {
+        self.inner.exists(key).await
+    }
+
+    async fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>, KvError> {
+        self.inner.scan_prefix(prefix).await
+    }
+
+    async fn scan_keys(
+        &self,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, KvError> {
+        self.inner.scan_keys(prefix, after, limit).await
+    }
+}
+
+#[cfg(feature = "memory-backend")]
+#[tokio::test]
+async fn memory_get_many_of_40_hashes_is_one_backend_call() {
+    let s = KvContentStore::new(Counting::new(MemoryStore::new()));
+    let all = bodies(40);
+    let hashes = s.put_many(&as_slices(&all)).await.unwrap();
+    let c = &s.inner().counts;
+    let before = count(&c.get_many);
+    let got = s.get_many(&hashes).await.unwrap();
+    assert_eq!(got.len(), 40);
+    assert_eq!(count(&c.get_many) - before, 1, "one get_many for the ask");
+    assert_eq!(count(&c.get), 0, "no get per hash");
+    assert_eq!(count(&c.put), 0);
+}
+
+#[cfg(feature = "memory-backend")]
+#[tokio::test]
+async fn memory_put_many_of_40_bodies_is_one_backend_put_many() {
+    let s = KvContentStore::new(Counting::new(MemoryStore::new()));
+    let all = bodies(40);
+    s.put_many(&as_slices(&all)).await.unwrap();
+    let c = &s.inner().counts;
+    assert_eq!(count(&c.put_many), 1);
+    assert_eq!(count(&c.put), 0);
+    assert_eq!(count(&c.get), 0);
+    assert_eq!(count(&c.get_many), 1, "which bodies are held: one ask");
+    assert_eq!(s.list(None, 100).await.unwrap().len(), 40);
+}
+
+#[cfg(feature = "memory-backend")]
+#[tokio::test]
+async fn memory_empty_batches_make_no_backend_call() {
+    let s = KvContentStore::new(Counting::new(MemoryStore::new()));
+    assert_eq!(s.get_many(&[]).await.unwrap().len(), 0);
+    assert_eq!(s.put_many(&[]).await.unwrap().len(), 0);
+    let c = &s.inner().counts;
+    for counter in [&c.get, &c.get_many, &c.put, &c.put_many] {
+        assert_eq!(count(counter), 0);
+    }
+}
+
 // The real backends complete each call without yielding. Introduce suspension
 // points so join! can expose races between the CAS's multiple backend calls.
 #[cfg(feature = "memory-backend")]
@@ -475,6 +704,46 @@ both_backends!(
     delete_removes_stored_at,
     memory_delete_removes_stored_at,
     rocksdb_delete_removes_stored_at
+);
+both_backends!(
+    put_many_then_get_many_roundtrip,
+    memory_put_many_then_get_many_roundtrip,
+    rocksdb_put_many_then_get_many_roundtrip
+);
+both_backends!(
+    get_many_keeps_the_asked_order,
+    memory_get_many_keeps_the_asked_order,
+    rocksdb_get_many_keeps_the_asked_order
+);
+both_backends!(
+    get_many_missing_is_none_in_place,
+    memory_get_many_missing_is_none_in_place,
+    rocksdb_get_many_missing_is_none_in_place
+);
+both_backends!(
+    get_many_same_hash_twice_is_two_answers,
+    memory_get_many_same_hash_twice_is_two_answers,
+    rocksdb_get_many_same_hash_twice_is_two_answers
+);
+both_backends!(
+    empty_batches_are_empty_answers,
+    memory_empty_batches_are_empty_answers,
+    rocksdb_empty_batches_are_empty_answers
+);
+both_backends!(
+    put_many_of_held_bodies_keeps_one_copy_and_refreshes_time,
+    memory_put_many_of_held_bodies_keeps_one_copy_and_refreshes_time,
+    rocksdb_put_many_of_held_bodies_keeps_one_copy_and_refreshes_time
+);
+both_backends!(
+    get_many_of_1000_hashes,
+    memory_get_many_of_1000_hashes,
+    rocksdb_get_many_of_1000_hashes
+);
+both_backends!(
+    get_many_with_a_corrupted_body_is_an_error,
+    memory_get_many_with_a_corrupted_body_is_an_error,
+    rocksdb_get_many_with_a_corrupted_body_is_an_error
 );
 
 #[cfg(feature = "rocksdb-backend")]

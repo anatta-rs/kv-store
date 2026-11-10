@@ -16,12 +16,18 @@ wraps a key-value backend. Each operation returns a `Result` with `KvError` on f
 | --- | --- |
 | `put(&[u8])` | `ContentHash`, computed from the uncompressed body |
 | `get(ContentHash)` | `Option<Vec<u8>>`, the uncompressed body or `None` |
+| `put_many(&[&[u8]])` | `Vec<ContentHash>`, one per body in order; one backend read and one backend write for the batch |
+| `get_many(&[ContentHash])` | `Vec<Option<Vec<u8>>>`, one answer per hash in the order asked (`None` in place of an absent one); one backend read for the batch |
 | `has(ContentHash)` | `bool`, whether the blob exists |
 | `delete(ContentHash)` | `()`, removing the blob and its stored time; absent blobs are a no-op |
 | `list(after: Option<ContentHash>, limit: usize)` | `Vec<(ContentHash, SystemTime)>` in ascending hash-hex order, strictly after the cursor, with at most `limit` entries |
 
 `get` verifies the decompressed body's hash and returns `KvError::HashMismatch`
-if it differs from the requested address.
+if it differs from the requested address; `get_many` does the same for each body
+and fails as a whole on the first mismatch. An empty batch makes no backend call.
+`KvStore` carries the matching `get_many` and `put_many`; their defaults loop over
+`get` and `put`, and `MemoryStore` (one lock) and `RocksDbStore` (`multi_get`,
+one `WriteBatch`) answer in one call.
 
 Each listed time is when the blob was last put. Re-putting an existing blob
 refreshes that time and leaves its bytes untouched. It lives in the sibling key `content-at:<hex>` as eight

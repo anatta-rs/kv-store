@@ -18,6 +18,37 @@ pub trait KvStore: Send + Sync {
     /// Insert or overwrite `key` with `value`.
     fn put(&self, key: &str, value: Vec<u8>) -> impl Future<Output = Result<(), KvError>> + Send;
 
+    /// Retrieve many keys at once: one answer per key, in the order asked,
+    /// `None` in place of an absent key. The default loops over [`KvStore::get`];
+    /// a backend overrides it to answer in one call.
+    fn get_many(
+        &self,
+        keys: &[String],
+    ) -> impl Future<Output = Result<Vec<Option<Vec<u8>>>, KvError>> + Send {
+        async move {
+            let mut values = Vec::with_capacity(keys.len());
+            for key in keys {
+                values.push(self.get(key).await?);
+            }
+            Ok(values)
+        }
+    }
+
+    /// Insert or overwrite many entries at once; a later entry wins over an earlier
+    /// one with the same key. The default loops over [`KvStore::put`]; a backend
+    /// overrides it to write in one call.
+    fn put_many(
+        &self,
+        entries: Vec<(String, Vec<u8>)>,
+    ) -> impl Future<Output = Result<(), KvError>> + Send {
+        async move {
+            for (key, value) in entries {
+                self.put(&key, value).await?;
+            }
+            Ok(())
+        }
+    }
+
     /// Remove `key`. No-op if the key does not exist.
     fn delete(&self, key: &str) -> impl Future<Output = Result<(), KvError>> + Send;
 
@@ -49,6 +80,20 @@ impl<T: KvStore + ?Sized> KvStore for &T {
 
     fn put(&self, key: &str, value: Vec<u8>) -> impl Future<Output = Result<(), KvError>> + Send {
         (**self).put(key, value)
+    }
+
+    fn get_many(
+        &self,
+        keys: &[String],
+    ) -> impl Future<Output = Result<Vec<Option<Vec<u8>>>, KvError>> + Send {
+        (**self).get_many(keys)
+    }
+
+    fn put_many(
+        &self,
+        entries: Vec<(String, Vec<u8>)>,
+    ) -> impl Future<Output = Result<(), KvError>> + Send {
+        (**self).put_many(entries)
     }
 
     fn delete(&self, key: &str) -> impl Future<Output = Result<(), KvError>> + Send {

@@ -5,6 +5,13 @@ Keep a Changelog format and Semantic Versioning.
 
 ## Unreleased
 
+### Added
+
+- `ContentStore::get_many` and `put_many`, and `KvStore::get_many` and `put_many` (default
+  bodies loop over `get` and `put`; memory in one lock, `RocksDB` in one `multi_get` and one
+  `WriteBatch`): `KvContentStore` makes one backend call per batch, not one per hash.
+  `ContentStore` gains two required methods: its implementors must add them.
+
 ## 0.2.1 - 2026-11-09
 
 ### Fixed
