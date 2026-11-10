@@ -4,6 +4,7 @@
 //! Reads verify the decompressed body against its address. Listing scans only
 //! content keys and reads their small sibling timestamp values.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -28,6 +29,23 @@ pub trait ContentStore: Send + Sync {
         &self,
         hash: ContentHash,
     ) -> impl Future<Output = Result<Option<Vec<u8>>, KvError>> + Send;
+
+    /// Retrieve and verify many bodies with one backend call: one answer per asked
+    /// hash, in the order asked, `None` in place of an absent hash. A hash asked
+    /// twice is answered twice; a corrupted body makes the whole call an error.
+    /// An empty ask is an empty answer and makes no backend call.
+    fn get_many(
+        &self,
+        hashes: &[ContentHash],
+    ) -> impl Future<Output = Result<Vec<Option<Vec<u8>>>, KvError>> + Send;
+
+    /// Hash and store many plain bodies with one read and one write on the backend:
+    /// one hash per body, in order. Held bodies only have their stored time
+    /// refreshed, as [`ContentStore::put`] does. An empty ask makes no backend call.
+    fn put_many(
+        &self,
+        bodies: &[&[u8]],
+    ) -> impl Future<Output = Result<Vec<ContentHash>, KvError>> + Send;
 
     /// Check whether the content hash is present.
     fn has(&self, hash: ContentHash) -> impl Future<Output = Result<bool, KvError>> + Send;
@@ -123,6 +141,64 @@ impl<K: KvStore> ContentStore for KvContentStore<K> {
             .await?
             .map(|raw| decompress_verified(hash, &raw))
             .transpose()
+    }
+
+    async fn get_many(&self, hashes: &[ContentHash]) -> Result<Vec<Option<Vec<u8>>>, KvError> {
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys: Vec<String> = hashes.iter().copied().map(key).collect();
+        let raws = self.inner.get_many(&keys).await?;
+        if raws.len() != hashes.len() {
+            return Err(KvError::Backend(format!(
+                "get_many answered {} values for {} keys",
+                raws.len(),
+                hashes.len()
+            )));
+        }
+        hashes
+            .iter()
+            .zip(raws)
+            .map(|(hash, raw)| raw.map(|raw| decompress_verified(*hash, &raw)).transpose())
+            .collect()
+    }
+
+    async fn put_many(&self, bodies: &[&[u8]]) -> Result<Vec<ContentHash>, KvError> {
+        if bodies.is_empty() {
+            return Ok(Vec::new());
+        }
+        let hashes: Vec<ContentHash> = bodies
+            .iter()
+            .map(|body| ContentHash::from_bytes(body))
+            .collect();
+        let _write = self.write.lock().await;
+        let stored_at = encode_time(SystemTime::now()).to_vec();
+        // Each distinct hash once, with the first body that has it.
+        let mut distinct: Vec<(ContentHash, &[u8])> = Vec::with_capacity(bodies.len());
+        let mut seen = HashSet::with_capacity(bodies.len());
+        for (hash, body) in hashes.iter().zip(bodies) {
+            if seen.insert(*hash) {
+                distinct.push((*hash, body));
+            }
+        }
+        let keys: Vec<String> = distinct.iter().map(|(hash, _)| key(*hash)).collect();
+        let held = self.inner.get_many(&keys).await?;
+        if held.len() != distinct.len() {
+            return Err(KvError::Backend(format!(
+                "get_many answered {} values for {} keys",
+                held.len(),
+                distinct.len()
+            )));
+        }
+        let mut entries = Vec::with_capacity(distinct.len() * 2);
+        for ((hash, body), held) in distinct.into_iter().zip(held) {
+            entries.push((stored_at_key(hash), stored_at.clone()));
+            if held.is_none() {
+                entries.push((key(hash), compress(body)?));
+            }
+        }
+        self.inner.put_many(entries).await?;
+        Ok(hashes)
     }
 
     async fn has(&self, hash: ContentHash) -> Result<bool, KvError> {

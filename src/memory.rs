@@ -39,6 +39,17 @@ impl KvStore for MemoryStore {
         Ok(())
     }
 
+    async fn get_many(&self, keys: &[String]) -> Result<Vec<Option<Vec<u8>>>, KvError> {
+        let map = self.guard()?;
+        Ok(keys.iter().map(|key| map.get(key).cloned()).collect())
+    }
+
+    async fn put_many(&self, entries: Vec<(String, Vec<u8>)>) -> Result<(), KvError> {
+        let mut map = self.guard()?;
+        map.extend(entries);
+        Ok(())
+    }
+
     async fn delete(&self, key: &str) -> Result<(), KvError> {
         let mut map = self.guard()?;
         map.remove(key);

@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use rocksdb::{DB, IteratorMode, Options};
+use rocksdb::{DB, IteratorMode, Options, WriteBatch};
 
 use crate::error::KvError;
 use crate::store::KvStore;
@@ -38,6 +38,23 @@ impl KvStore for RocksDbStore {
 
     async fn put(&self, key: &str, value: Vec<u8>) -> Result<(), KvError> {
         self.db.put(key.as_bytes(), &value)?;
+        Ok(())
+    }
+
+    async fn get_many(&self, keys: &[String]) -> Result<Vec<Option<Vec<u8>>>, KvError> {
+        self.db
+            .multi_get(keys.iter().map(String::as_bytes))
+            .into_iter()
+            .map(|value| value.map_err(KvError::from))
+            .collect()
+    }
+
+    async fn put_many(&self, entries: Vec<(String, Vec<u8>)>) -> Result<(), KvError> {
+        let mut batch = WriteBatch::default();
+        for (key, value) in &entries {
+            batch.put(key.as_bytes(), value);
+        }
+        self.db.write(batch)?;
         Ok(())
     }
 
