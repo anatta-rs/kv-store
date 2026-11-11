@@ -5,7 +5,23 @@ Keep a Changelog format and Semantic Versioning.
 
 ## Unreleased
 
+### Breaking
+
+- `ContentStore` gains two required methods, `delete_many` and `delete_many_force`: its
+  implementors must add them. `KvContentStore::new` is unchanged; a new constructor
+  `with_options` takes a `ContentOptions { grace }` (default one hour).
+
 ### Added
+
+- `ContentStore::delete_many(&[ContentHash]) -> DeleteOutcome { destroyed, kept, absent }`:
+  a put always wins. A hash whose last put (`content-at`) is younger than the grace is kept;
+  an older one is destroyed, body and time, in one batch. The read of the times and the batch
+  run under the store's write lock, so a put racing a delete ends with the bytes present
+  whatever the order. `delete_many_force` ignores the grace, for an offline repair.
+- `KvStore::delete_many` (default loops `delete`; memory in one lock, `RocksDB` in one
+  `WriteBatch`).
+- `RocksDbStore::open_with(path, RocksDbOptions { sync_writes })`: fsync the write-ahead log
+  on every write, off by default (`open` is unchanged). Cost measured in task 004.
 
 - `ContentStore::get_many` and `put_many`, and `KvStore::get_many` and `put_many` (default
   bodies loop over `get` and `put`; memory in one lock, `RocksDB` in one `multi_get` and one
