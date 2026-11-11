@@ -20,6 +20,8 @@ wraps a key-value backend. Each operation returns a `Result` with `KvError` on f
 | `get_many(&[ContentHash])` | `Vec<Option<Vec<u8>>>`, one answer per hash in the order asked (`None` in place of an absent one); one backend read for the batch |
 | `has(ContentHash)` | `bool`, whether the blob exists |
 | `delete(ContentHash)` | `()`, removing the blob and its stored time; absent blobs are a no-op |
+| `delete_many(&[ContentHash])` | `DeleteOutcome { destroyed, kept, absent }`: bodies and times whose last put is older than the store's grace (default one hour, `ContentOptions`) are destroyed in one batch; a younger one is kept; a put always wins |
+| `delete_many_force(&[ContentHash])` | `Vec<ContentHash>` destroyed, ignoring the grace (offline repair) |
 | `list(after: Option<ContentHash>, limit: usize)` | `Vec<(ContentHash, SystemTime)>` in ascending hash-hex order, strictly after the cursor, with at most `limit` entries |
 
 `get` verifies the decompressed body's hash and returns `KvError::HashMismatch`
@@ -35,6 +37,9 @@ bytes of big-endian `u64` Unix milliseconds, written before a new blob's bytes.
 `list` uses `KvStore::scan_keys` to page over content keys and reads only their
 small timestamp values. A blob without a recorded time is listed with
 `std::time::UNIX_EPOCH`.
+
+`RocksDbStore::open_with(path, RocksDbOptions { sync_writes: true })` fsyncs the
+write-ahead log on every write; `open` leaves it off.
 
 ## Example
 
