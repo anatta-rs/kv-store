@@ -20,7 +20,9 @@ pub mod memory;
 pub mod rocksdb;
 pub mod store;
 
-pub use content::{CONTENT_PREFIX, ContentStore, KvContentStore, STORED_AT_PREFIX};
+pub use content::{
+    CONTENT_PREFIX, ContentOptions, ContentStore, DeleteOutcome, KvContentStore, STORED_AT_PREFIX,
+};
 pub use error::KvError;
 pub use hash::ContentHash;
 #[cfg(feature = "http-server")]
@@ -28,7 +30,7 @@ pub use http::HttpKvStore;
 #[cfg(feature = "memory-backend")]
 pub use memory::MemoryStore;
 #[cfg(feature = "rocksdb-backend")]
-pub use rocksdb::RocksDbStore;
+pub use rocksdb::{RocksDbOptions, RocksDbStore};
 pub use store::KvStore;
 
 // Compile and run the README example whenever the memory backend's doctests run.

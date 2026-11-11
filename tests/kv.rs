@@ -59,6 +59,19 @@ async fn delete_missing_is_ok<K: KvStore>(k: &K) {
     assert!(!k.exists("missing").await.unwrap());
 }
 
+async fn delete_many_removes_listed_keys_and_ignores_missing<K: KvStore>(k: &K) {
+    for key in ["a", "b", "c"] {
+        k.put(key, vec![1]).await.unwrap();
+    }
+    k.delete_many(&["a".into(), "missing".into(), "c".into(), "a".into()])
+        .await
+        .unwrap();
+    assert!(!k.exists("a").await.unwrap());
+    assert!(k.exists("b").await.unwrap());
+    assert!(!k.exists("c").await.unwrap());
+    k.delete_many(&[]).await.unwrap();
+}
+
 macro_rules! both_backends {
     ($case:ident, $memory:ident, $rocksdb:ident) => {
         #[cfg(feature = "memory-backend")]
@@ -91,4 +104,9 @@ both_backends!(
     delete_missing_is_ok,
     memory_delete_missing_is_ok,
     rocksdb_delete_missing_is_ok
+);
+both_backends!(
+    delete_many_removes_listed_keys_and_ignores_missing,
+    memory_delete_many_removes_listed_keys_and_ignores_missing,
+    rocksdb_delete_many_removes_listed_keys_and_ignores_missing
 );

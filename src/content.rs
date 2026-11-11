@@ -18,6 +18,35 @@ pub const CONTENT_PREFIX: &str = "content:";
 /// Prefix for last-put timestamps, followed by the content hash in hex.
 pub const STORED_AT_PREFIX: &str = "content-at:";
 
+/// How a [`ContentStore::delete_many`] ask was answered, each asked hash in one list
+/// (a hash asked twice is answered once), in the order first asked.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeleteOutcome {
+    /// Hashes whose bytes and time were removed.
+    pub destroyed: Vec<ContentHash>,
+    /// Hashes left in place because their last put is younger than the grace.
+    pub kept: Vec<ContentHash>,
+    /// Hashes that were not held: never there, or already destroyed.
+    pub absent: Vec<ContentHash>,
+}
+
+/// Settings of a [`KvContentStore`], given to [`KvContentStore::with_options`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentOptions {
+    /// How long after its last put a hash is safe from [`ContentStore::delete_many`]:
+    /// a put and a delete racing within this time leave the bytes in place.
+    pub grace: Duration,
+}
+
+impl Default for ContentOptions {
+    /// A grace of one hour.
+    fn default() -> Self {
+        Self {
+            grace: Duration::from_secs(3600),
+        }
+    }
+}
+
 /// Async port for hash-addressed content with verified reads and paged listing.
 pub trait ContentStore: Send + Sync {
     /// Hash and store the plain body. Putting a held blob again leaves its bytes
@@ -53,6 +82,24 @@ pub trait ContentStore: Send + Sync {
     /// Remove the body and its stored time. Absent content is a no-op.
     fn delete(&self, hash: ContentHash) -> impl Future<Output = Result<(), KvError>> + Send;
 
+    /// Destroy the bodies and stored times of the hashes whose last put is older than
+    /// the store's grace, in one batch, and say which hashes were destroyed, which
+    /// were kept (a put within the grace) and which were not held. A put always wins:
+    /// it never interleaves with this call, so a put issued after the read of the times
+    /// waits and re-creates the hash, and a put before it keeps the hash. An empty ask
+    /// makes no backend call.
+    fn delete_many(
+        &self,
+        hashes: &[ContentHash],
+    ) -> impl Future<Output = Result<DeleteOutcome, KvError>> + Send;
+
+    /// As [`ContentStore::delete_many`] but ignoring the grace, for an offline repair:
+    /// every held hash is destroyed. Returns the destroyed hashes.
+    fn delete_many_force(
+        &self,
+        hashes: &[ContentHash],
+    ) -> impl Future<Output = Result<Vec<ContentHash>, KvError>> + Send;
+
     /// Hashes in ascending hex order, strictly after `after`, at most `limit`,
     /// each with the time of its last put ([`UNIX_EPOCH`] when none is recorded).
     fn list(
@@ -69,20 +116,74 @@ pub trait ContentStore: Send + Sync {
 pub struct KvContentStore<K: KvStore> {
     inner: K,
     write: tokio::sync::Mutex<()>,
+    grace: Duration,
 }
 
 impl<K: KvStore> KvContentStore<K> {
     /// Wrap the given key-value backend as a content store.
     pub fn new(inner: K) -> Self {
+        Self::with_options(inner, ContentOptions::default())
+    }
+
+    /// Wrap the given key-value backend as a content store with the given settings.
+    pub fn with_options(inner: K, options: ContentOptions) -> Self {
         Self {
             inner,
             write: tokio::sync::Mutex::new(()),
+            grace: options.grace,
         }
     }
 
     /// Borrow the underlying key-value backend.
     pub fn inner(&self) -> &K {
         &self.inner
+    }
+
+    // Runs under the write lock: no put slips between the read of the times and the batch.
+    async fn delete_stale(
+        &self,
+        hashes: &[ContentHash],
+        grace: Option<Duration>,
+    ) -> Result<DeleteOutcome, KvError> {
+        let mut seen = HashSet::with_capacity(hashes.len());
+        let distinct: Vec<ContentHash> =
+            hashes.iter().copied().filter(|h| seen.insert(*h)).collect();
+        let mut outcome = DeleteOutcome::default();
+        if distinct.is_empty() {
+            return Ok(outcome);
+        }
+        let _write = self.write.lock().await;
+        let now = SystemTime::now();
+        let time_keys: Vec<String> = distinct.iter().copied().map(stored_at_key).collect();
+        let raws = self.inner.get_many(&time_keys).await?;
+        if raws.len() != distinct.len() {
+            return Err(KvError::Backend(format!(
+                "get_many answered {} values for {} keys",
+                raws.len(),
+                distinct.len()
+            )));
+        }
+        let mut doomed = Vec::new();
+        for (hash, raw) in distinct.into_iter().zip(raws) {
+            let last_put = raw.map(|raw| decode_time(&raw)).transpose()?;
+            if let (Some(grace), Some(last_put)) = (grace, last_put)
+                && is_younger(now, last_put, grace)
+            {
+                outcome.kept.push(hash);
+            } else if self.has(hash).await? {
+                doomed.extend([key(hash), stored_at_key(hash)]);
+                outcome.destroyed.push(hash);
+            } else {
+                if last_put.is_some() {
+                    doomed.push(stored_at_key(hash));
+                }
+                outcome.absent.push(hash);
+            }
+        }
+        if !doomed.is_empty() {
+            self.inner.delete_many(&doomed).await?;
+        }
+        Ok(outcome)
     }
 
     async fn list_hashes(
@@ -211,6 +312,14 @@ impl<K: KvStore> ContentStore for KvContentStore<K> {
         self.inner.delete(&stored_at_key(hash)).await
     }
 
+    async fn delete_many(&self, hashes: &[ContentHash]) -> Result<DeleteOutcome, KvError> {
+        self.delete_stale(hashes, Some(self.grace)).await
+    }
+
+    async fn delete_many_force(&self, hashes: &[ContentHash]) -> Result<Vec<ContentHash>, KvError> {
+        Ok(self.delete_stale(hashes, None).await?.destroyed)
+    }
+
     async fn list(
         &self,
         after: Option<ContentHash>,
@@ -235,6 +344,14 @@ fn key(hash: ContentHash) -> String {
 
 fn stored_at_key(hash: ContentHash) -> String {
     format!("{STORED_AT_PREFIX}{hash}")
+}
+
+// A time in the future (clock skew) counts as just now.
+fn is_younger(now: SystemTime, last_put: SystemTime, grace: Duration) -> bool {
+    match now.duration_since(last_put) {
+        Ok(age) => age < grace,
+        Err(_) => true,
+    }
 }
 
 fn encode_time(t: SystemTime) -> [u8; 8] {

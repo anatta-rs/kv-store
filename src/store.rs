@@ -52,6 +52,18 @@ pub trait KvStore: Send + Sync {
     /// Remove `key`. No-op if the key does not exist.
     fn delete(&self, key: &str) -> impl Future<Output = Result<(), KvError>> + Send;
 
+    /// Remove many keys at once; absent keys are ignored. The default loops over
+    /// [`KvStore::delete`]; a backend overrides it to remove them in one atomic batch,
+    /// so a failure leaves every key in place.
+    fn delete_many(&self, keys: &[String]) -> impl Future<Output = Result<(), KvError>> + Send {
+        async move {
+            for key in keys {
+                self.delete(key).await?;
+            }
+            Ok(())
+        }
+    }
+
     /// Check whether `key` exists.
     fn exists(&self, key: &str) -> impl Future<Output = Result<bool, KvError>> + Send;
 
@@ -98,6 +110,10 @@ impl<T: KvStore + ?Sized> KvStore for &T {
 
     fn delete(&self, key: &str) -> impl Future<Output = Result<(), KvError>> + Send {
         (**self).delete(key)
+    }
+
+    fn delete_many(&self, keys: &[String]) -> impl Future<Output = Result<(), KvError>> + Send {
+        (**self).delete_many(keys)
     }
 
     fn exists(&self, key: &str) -> impl Future<Output = Result<bool, KvError>> + Send {

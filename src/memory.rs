@@ -56,6 +56,14 @@ impl KvStore for MemoryStore {
         Ok(())
     }
 
+    async fn delete_many(&self, keys: &[String]) -> Result<(), KvError> {
+        let mut map = self.guard()?;
+        for key in keys {
+            map.remove(key);
+        }
+        Ok(())
+    }
+
     async fn exists(&self, key: &str) -> Result<bool, KvError> {
         let map = self.guard()?;
         Ok(map.contains_key(key))
